@@ -1638,6 +1638,32 @@ def parse_nfdump_csv(lines: Iterator[str]) -> Iterator[Dict[str, int]]:
         yield rec
 
 
+#: nfcapd files are named nfcapd.YYYYMMDDHHMM, or nfcapd.YYYYMMDDHHMMSS when the
+#: rotation interval is under 60s. (nfcapd.current.<pid> is the live file.)
+_NFCAPD_RE = re.compile(r'nfcapd\.(\d{14}|\d{12})$')
+
+
+def nfcapd_filetime(path: str) -> Optional[int]:
+    """Capture time parsed from an nfcapd.<stamp> filename, or None if it doesn't
+    match (e.g. nfcapd.current.<pid> or a non-nfcapd name)."""
+    m = _NFCAPD_RE.search(os.path.basename(path))
+    if not m:
+        return None
+    stamp = m.group(1)
+    fmt = "%Y%m%d%H%M%S" if len(stamp) == 14 else "%Y%m%d%H%M"
+    try:
+        return int(datetime.datetime.strptime(stamp, fmt).timestamp())
+    except ValueError:
+        return None
+
+
+def _mtime_or_now(path: str) -> int:
+    try:
+        return int(os.path.getmtime(path))
+    except OSError:
+        return int(time.time())
+
+
 class NfdumpReader:
     """Reads nfcapd files by invoking the `nfdump` binary and parsing its CSV.
 
@@ -1646,29 +1672,14 @@ class NfdumpReader:
     in JKFlow.py needs to change.
     """
 
-    #: nfcapd files are named nfcapd.YYYYMMDDHHMM, or nfcapd.YYYYMMDDHHMMSS when
-    #: the rotation interval is under 60s. (nfcapd.current.<pid> is the live file
-    #: and has no timestamp -> falls back to mtime.)
-    _NFCAPD_RE = re.compile(r'nfcapd\.(\d{14}|\d{12})$')
-
     def __init__(self, nfdump: str = 'nfdump', extra_args: Optional[List[str]] = None):
         self.nfdump = nfdump
         self.extra_args = extra_args or []
 
     def filetime_for(self, path: str) -> int:
         """Nominal capture time: from the nfcapd.<stamp> filename, else mtime."""
-        m = self._NFCAPD_RE.search(os.path.basename(path))
-        if m:
-            stamp = m.group(1)
-            fmt = "%Y%m%d%H%M%S" if len(stamp) == 14 else "%Y%m%d%H%M"
-            try:
-                return int(datetime.datetime.strptime(stamp, fmt).timestamp())
-            except ValueError:
-                pass
-        try:
-            return int(os.path.getmtime(path))
-        except OSError:
-            return int(time.time())
+        ft = nfcapd_filetime(path)
+        return ft if ft is not None else _mtime_or_now(path)
 
     def records(self, path: str) -> Iterator[Dict[str, int]]:
         cmd = [self.nfdump, '-r', path, '-q', '-o', 'csv'] + self.extra_args
@@ -1697,12 +1708,12 @@ class CsvFlowReader:
         self._filetime = filetime
 
     def filetime_for(self, path: str) -> int:
+        # Explicit override wins; otherwise use the nfcapd timestamp in the name
+        # (so sorting still works on nfcapd-named CSVs), falling back to mtime.
         if self._filetime is not None:
             return self._filetime
-        try:
-            return int(os.path.getmtime(path))
-        except OSError:
-            return int(time.time())
+        ft = nfcapd_filetime(path)
+        return ft if ft is not None else _mtime_or_now(path)
 
     def records(self, path: str) -> Iterator[Dict[str, int]]:
         import sys
@@ -1770,6 +1781,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "(e.g. 'processed') are relative to the file's own directory; "
                          "absolute paths are used as-is. The live nfcapd.current.* file "
                          "is never moved.")
+    ap.add_argument('--no-sort', action='store_true',
+                    help="Process files in the given order instead of sorting by "
+                         "capture time (sorting is the default and keeps RRD updates "
+                         "monotonic).")
+    ap.add_argument('--include-current', action='store_true',
+                    help="Also process the live nfcapd.current.* file (skipped by "
+                         "default because it is still being written).")
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args(argv)
 
@@ -1784,18 +1802,32 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     reader = CsvFlowReader() if args.csv else NfdumpReader(nfdump=args.nfdump)
 
+    # Process strictly in chronological order. RRD requires monotonically
+    # increasing update timestamps, so out-of-order files (e.g. from an unsorted
+    # shell glob, mixed 12-/14-digit names, or the lexically-last nfcapd.current)
+    # would trigger "illegal attempt to update using time ... when last update
+    # time is ...". Sorting by the derived capture time makes it order-independent.
+    files = list(args.files)
+    if not args.no_sort:
+        files.sort(key=reader.filetime_for)
+
     total = 0
-    for path in args.files:
+    for path in files:
+        base = os.path.basename(path)
+        # The live capture file is still being written -> incomplete and its
+        # timestamp is only an mtime; skip it unless asked to include it.
+        if 'current' in base and not args.include_current:
+            print(f"Skipping live capture file {path} (use --include-current to process it)")
+            continue
         n = process_file(jk, reader, path)
         total += n
         print(f"Processed {n} flows from {path} (filetime={jk.filetime})")
-        # Move the file aside only after it was processed without raising, and
-        # never the live capture file.
-        if args.processed_dir and 'current' not in os.path.basename(path):
+        # Move the file aside only after it was processed without raising.
+        if args.processed_dir and 'current' not in base:
             dest = move_processed(path, args.processed_dir)
             if dest:
                 print(f"  -> moved to {dest}")
-    print(f"Done. {total} flows across {len(args.files)} file(s).")
+    print(f"Done. {total} flows across {len(files)} file(s).")
     return 0
 
 
