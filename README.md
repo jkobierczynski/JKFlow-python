@@ -97,7 +97,7 @@ nfpcapd ──► /var/flows/nfdump/nfcapd.YYYYMMDDHHMM
 | `setup-jkgrapher-apache.yml` | Ansible: serve JKGrapher.pl under Apache. |
 | `.yamllint` | Lint config for the playbooks. |
 | `INSTALL.md` | Full installation guide. |
-| `JKFlow-manual.md` | JKFlow.py usage manual. |
+| `JKFlow-python/JKFlow-manual.md` | JKFlow.py usage manual. |
 | `CHANGELOG.md` | Version history. |
 
 ---
