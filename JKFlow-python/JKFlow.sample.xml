@@ -1,0 +1,18 @@
+<config>
+  <rrddir>/var/flows/rrds</rrddir>
+  <scoredir>/var/flows/reports</scoredir>
+  <sampletime>300</sampletime>
+  <all localsubnets="10.0.0.0/8">
+    <total/>
+    <protocols>tcp,udp</protocols>
+    <otherprotocols/>
+    <services>80/tcp,443/tcp,53/udp</services>
+    <otherservices/>
+  </all>
+  <directions>
+    <direction name="dmz" fromsubnets="10.1.0.0/16" tosubnets="10.2.0.0/16">
+      <total/>
+      <services>22/tcp</services>
+    </direction>
+  </directions>
+</config>
