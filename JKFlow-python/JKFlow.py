@@ -236,7 +236,7 @@ class FlowScan:
     def updateRRD(self, dir: str, name: str, values: List[float]) -> None:
         if rrdtool is None:
             return
-        file = os.path.join(getattr(self, 'RRDDIR', '.'), dir, name)
+        file = os.path.join(getattr(self, 'RRDDIR', '.'), dir.lstrip('/'), name)
         timestamp = getattr(self, 'filetime', int(datetime.datetime.now().timestamp()))
         try:
             rrdtool.update(file, f"{timestamp}:{':'.join(map(str, values))}")
@@ -862,7 +862,9 @@ class JKFlow(FlowScan):
 
     def reporttorrd(self, dir: str, name: str, ref: Dict, samplerate: float):
         """Generate and update RRD files."""
-        file = os.path.join(self.RRDDIR, dir, name)
+        # lstrip: a leading '/' in dir would make os.path.join discard RRDDIR and
+        # write to the filesystem root. Sub-paths are always relative to RRDDIR.
+        file = os.path.join(self.RRDDIR, dir.lstrip('/'), name)
         if not os.path.exists(file):
             print(f"Creating RRD-File {file}")
             self.createGeneralRRD(file, [
@@ -885,6 +887,7 @@ class JKFlow(FlowScan):
 
     def reporttorrdfiles(self, dir: str, ref: Dict, samplerate: float):
         """Recursively generate RRD files for all metrics."""
+        dir = dir.lstrip('/')
         dir_path = os.path.join(self.RRDDIR, dir)
         if not os.path.exists(dir_path):
             os.makedirs(dir_path, mode=0o755)
@@ -944,15 +947,15 @@ class JKFlow(FlowScan):
     def report(self):
         """Generate all reports."""
         if 'all' in self.mylist:
-            self.reporttorrdfiles("/all", self.mylist['all'], self.mylist['all']['samplerate'])
+            self.reporttorrdfiles("all", self.mylist['all'], self.mylist['all']['samplerate'])
         for direction in self.mylist['direction']:
-            self.reporttorrdfiles(f"/{direction}", self.mylist['direction'][direction], self.mylist['direction'][direction]['samplerate'])
+            self.reporttorrdfiles(direction, self.mylist['direction'][direction], self.mylist['direction'][direction]['samplerate'])
 
     def updateRRD(self, dir: str, name: str, values: List[float]):
         """Update an RRD file with new values."""
         if rrdtool is None:
             return
-        file = os.path.join(self.RRDDIR, dir, name)
+        file = os.path.join(self.RRDDIR, dir.lstrip('/'), name)
         timestamp = getattr(self, 'filetime', int(datetime.datetime.now().timestamp()))
         try:
             rrdtool.update(file, f"{timestamp}:{':'.join(map(str, values))}")
@@ -961,6 +964,7 @@ class JKFlow(FlowScan):
 
     def scoreboard(self, dir: str, ref: Dict, samplerate: float):
         """Generate HTML scoreboard reports."""
+        dir = dir.lstrip('/')
         filetime = getattr(self, 'filetime', int(time.time()))
         dt = datetime.datetime.fromtimestamp(filetime)
         year, mon, mday, hour, min_, sec = dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
@@ -1051,6 +1055,7 @@ class JKFlow(FlowScan):
 
     def count_aggdata(self, dir: str, ref: List[Dict], newaggdata: Dict, filetime: int):
         """Update aggregate scoreboard data."""
+        dir = dir.lstrip('/')
         for report in ref:
             if filetime > report.get('startperiod', 0) + report['count'] * self.SAMPLETIME:
                 if report.get('startperiod') == 0:
@@ -1723,6 +1728,29 @@ def process_file(jk: 'JKFlow', reader, path: str) -> int:
     return n
 
 
+def move_processed(path: str, processed_dir: str) -> Optional[str]:
+    """Move a processed flow file into processed_dir.
+
+    A relative processed_dir (e.g. 'processed') is taken relative to the file's
+    own directory; an absolute path is used as-is. Returns the new path, or None
+    if the move was skipped/failed.
+    """
+    import shutil
+    base = os.path.basename(path)
+    if os.path.isabs(processed_dir):
+        target_dir = processed_dir
+    else:
+        target_dir = os.path.join(os.path.dirname(os.path.abspath(path)), processed_dir)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        dest = os.path.join(target_dir, base)
+        shutil.move(path, dest)
+        return dest
+    except OSError as e:
+        logging.warning(f"Could not move {path} to {target_dir}: {e}")
+        return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(
@@ -1737,6 +1765,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument('--nfdump', default='nfdump', help="Path to the nfdump binary")
     ap.add_argument('--csv', action='store_true',
                     help="Treat inputs as nfdump CSV files instead of nfcapd binaries")
+    ap.add_argument('--processed-dir', default=None, metavar='DIR',
+                    help="After processing, move each flow file here. Relative names "
+                         "(e.g. 'processed') are relative to the file's own directory; "
+                         "absolute paths are used as-is. The live nfcapd.current.* file "
+                         "is never moved.")
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args(argv)
 
@@ -1756,6 +1789,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         n = process_file(jk, reader, path)
         total += n
         print(f"Processed {n} flows from {path} (filetime={jk.filetime})")
+        # Move the file aside only after it was processed without raising, and
+        # never the live capture file.
+        if args.processed_dir and 'current' not in os.path.basename(path):
+            dest = move_processed(path, args.processed_dir)
+            if dest:
+                print(f"  -> moved to {dest}")
     print(f"Done. {total} flows across {len(args.files)} file(s).")
     return 0
 
