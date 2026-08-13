@@ -1,0 +1,181 @@
+---
+# install-jkflow-deps.yml
+#
+# Install the runtime dependencies for the Python port of JKFlow (JKFlow.py) on
+# Debian and Devuan.
+#
+# Devuan is init-agnostic (sysvinit / OpenRC / runit), so this playbook installs
+# dependencies ONLY and manages no services — nothing here calls systemctl or the
+# service module. Setting up an nfcapd collector daemon is deliberately left out
+# (its init script differs per Devuan flavour); see the note at the bottom.
+#
+# The Python packages go into a dedicated virtualenv. That keeps the two C
+# extensions (pytricia, rrdtool) isolated and sidesteps PEP 668
+# ("externally-managed-environment"), which otherwise blocks pip on Debian 12+
+# and recent Devuan. No --break-system-packages needed inside a venv.
+#
+# Usage:
+#   ansible-playbook -i inventory install-jkflow-deps.yml
+#   # local machine:
+#   ansible-playbook -i localhost, -c local install-jkflow-deps.yml
+#   # deploy the module too:
+#   ansible-playbook -i inventory install-jkflow-deps.yml -e jkflow_src=./JKFlow.py
+#
+# Handy tags:  packages | venv | verify   (e.g. --tags verify)
+
+- name: Install JKFlow (Python) dependencies
+  hosts: "{{ jkflow_target | default('localhost') }}"
+  become: true
+
+  vars:
+    # Where the virtualenv and (optionally) the module live.
+    jkflow_home: /opt/jkflow
+    jkflow_venv: "{{ jkflow_home }}/venv"
+
+    # Owner of the install tree. Defaults to root (a standard /opt system
+    # install; the venv is built as root and is world-readable/executable).
+    # Override to a service account if you deploy JKFlow.py to run as one.
+    jkflow_owner: root
+    jkflow_group: root
+
+    # Optional: path to JKFlow.py on the CONTROLLER to copy onto the target.
+    # Leave empty to install dependencies only.
+    jkflow_src: ""
+
+    # APT: nfdump + the OFFICIAL rrdtool Python binding (python3-rrdtool),
+    # prebuilt by the distro against the system Python and librrd. This replaces
+    # the stale third-party `rrdtool` PyPI package, which does not compile against
+    # Python 3.13 (Excalibur/Trixie). pytricia is the only dependency not packaged
+    # by Debian/Devuan, so it stays as the sole pip build (needs the compiler).
+    #   build-essential + python3-dev  -> compile pytricia
+    #   python3-rrdtool                -> the rrdtool binding JKFlow.py imports
+    #   rrdtool                        -> CLI (optional, handy for graphing/debug)
+    #   nfdump                         -> the flow reader JKFlow.py shells out to
+    #   python3-venv / python3-pip     -> create the venv, bootstrap pip
+    jkflow_apt_packages:
+      - build-essential
+      - python3
+      - python3-dev
+      - python3-venv
+      - python3-pip
+      - python3-rrdtool
+      - rrdtool
+      - nfdump
+
+    # PyPI packages installed INTO the venv (rrdtool deliberately NOT here -- it
+    # comes from apt as python3-rrdtool and is picked up via system site-packages).
+    # Pin here for reproducible builds, e.g. "pytricia==1.3.0".
+    jkflow_pip_packages:
+      - xmltodict
+      - tabulate
+      - pytricia
+
+  pre_tasks:
+    - name: Fail early on unsupported distributions
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] in ['Debian', 'Devuan']
+        fail_msg: >-
+          This playbook targets Debian and Devuan only
+          (detected {{ ansible_facts['distribution'] | default('unknown') }}).
+        success_msg: "Distribution {{ ansible_facts['distribution'] }} is supported."
+      tags: [always]
+
+  tasks:
+    - name: Install system packages (libraries, build tools, nfdump, rrdtool)
+      ansible.builtin.apt:
+        name: "{{ jkflow_apt_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      tags: [packages]
+
+    - name: Ensure the JKFlow install directory exists
+      ansible.builtin.file:
+        path: "{{ jkflow_home }}"
+        state: directory
+        owner: "{{ jkflow_owner }}"
+        group: "{{ jkflow_group }}"
+        mode: "0755"
+      tags: [venv]
+
+    # A venv created WITHOUT system site-packages (e.g. a previous failed run)
+    # cannot see the apt-installed python3-rrdtool. venv creation is one-shot, so
+    # such a venv must be removed and rebuilt with the right flag.
+    - name: Read existing pyvenv.cfg (if any)
+      ansible.builtin.slurp:
+        src: "{{ jkflow_venv }}/pyvenv.cfg"
+      register: jkflow_pyvenv
+      failed_when: false
+      tags: [venv]
+
+    - name: Remove a stale venv that lacks system site-packages
+      ansible.builtin.file:
+        path: "{{ jkflow_venv }}"
+        state: absent
+      when:
+        - jkflow_pyvenv.content is defined
+        - "'include-system-site-packages = true' not in (jkflow_pyvenv.content | b64decode)"
+      tags: [venv]
+
+    # Creating the venv and installing into it are two pip tasks so the first can
+    # ensure build tooling (setuptools/wheel) before pytricia builds. The venv is
+    # created WITH system site-packages so it can import the apt python3-rrdtool.
+    - name: Create virtualenv (with system site-packages) and ensure build tooling
+      ansible.builtin.pip:
+        name:
+          - setuptools
+          - wheel
+        state: present
+        virtualenv: "{{ jkflow_venv }}"
+        virtualenv_command: python3 -m venv
+        virtualenv_site_packages: true
+      tags: [venv]
+
+    - name: Install JKFlow Python dependencies into the virtualenv
+      ansible.builtin.pip:
+        name: "{{ jkflow_pip_packages }}"
+        state: present
+        virtualenv: "{{ jkflow_venv }}"
+        virtualenv_command: python3 -m venv
+        virtualenv_site_packages: true
+      tags: [venv]
+
+    - name: Deploy JKFlow.py (only when jkflow_src is provided)
+      ansible.builtin.copy:
+        src: "{{ jkflow_src }}"
+        dest: "{{ jkflow_home }}/JKFlow.py"
+        owner: "{{ jkflow_owner }}"
+        group: "{{ jkflow_group }}"
+        mode: "0755"
+      when: jkflow_src | length > 0
+      tags: [deploy]
+
+  post_tasks:
+    # `command -v` is a shell builtin (the command module can't run it), and the
+    # standalone `which` binary is deprecated on Debian 13/Devuan Excalibur, so the
+    # shell module here is correct rather than a code smell.
+    - name: Verify nfdump is on PATH
+      ansible.builtin.shell: command -v nfdump  # noqa: command-instead-of-shell
+      register: jkflow_nfdump
+      changed_when: false
+      tags: [verify]
+
+    - name: Verify every Python dependency imports inside the venv
+      ansible.builtin.command: >-
+        {{ jkflow_venv }}/bin/python -c
+        "import xmltodict, tabulate, pytricia, rrdtool;
+        print('xmltodict', xmltodict.__version__ if hasattr(xmltodict,'__version__') else 'ok');
+        print('rrdtool', rrdtool.__version__ if hasattr(rrdtool,'__version__') else 'ok');
+        print('pytricia ok'); print('tabulate ok')"
+      register: jkflow_imports
+      changed_when: false
+      tags: [verify]
+
+    - name: Show verification results
+      ansible.builtin.debug:
+        msg: >-
+          nfdump: {{ jkflow_nfdump.stdout }} |
+          venv: {{ jkflow_venv }} |
+          imports OK -> {{ jkflow_imports.stdout_lines | join(', ') }}
+      tags: [verify]

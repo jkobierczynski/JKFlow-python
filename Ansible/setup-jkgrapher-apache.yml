@@ -1,0 +1,187 @@
+---
+# setup-jkgrapher-apache.yml
+#
+# Deploy the JKGrapher.pl CGI grapher (companion to JKFlow) under Apache on
+# Debian and Devuan, and wire up CGI execution + the Perl RRD/CGI dependencies.
+#
+# Devuan is init-agnostic (sysvinit / OpenRC), so Apache is managed through the
+# init-agnostic `service` module -- never the systemd module. On a default
+# sysvinit Devuan this enables apache2 via update-rc.d; on OpenRC you may instead
+# need `rc-update add apache2 default` (see the note at the bottom).
+#
+# This playbook deploys YOUR JKGrapher.pl -- point jkgrapher_src at the file on
+# the controller. It does not invent the script. If jkgrapher_src is left empty,
+# Apache/CGI is still set up and ready, and the deploy step is skipped.
+#
+# Security: a CGI grapher is a live attack surface, so access defaults to
+# localhost only. Widen jkgrapher_require deliberately (e.g. to a management
+# subnet) rather than exposing it to the world.
+#
+# Usage:
+#   ansible-playbook -i inventory setup-jkgrapher-apache.yml \
+#       -e jkgrapher_src=./JKGrapher.pl -e jkgrapher_rrddir=/var/lib/jkflow/rrd
+#   # local box:
+#   ansible-playbook -i "localhost," -c local setup-jkgrapher-apache.yml \
+#       -e jkgrapher_src=./JKGrapher.pl
+#
+# Tags:  packages | apache | deploy | verify
+
+- name: Set up JKGrapher.pl CGI under Apache
+  hosts: "{{ jkgrapher_target | default('localhost') }}"
+  become: true
+
+  vars:
+    # Path on the CONTROLLER to your JKGrapher.pl. Empty -> skip the deploy.
+    jkgrapher_src: ""
+
+    # Where the CGI lives on the target and the URL it is served under.
+    jkgrapher_cgi_dir: /usr/lib/cgi-bin/jkgrapher
+    jkgrapher_script_name: JKGrapher.pl
+    jkgrapher_url_path: /jkgrapher
+
+    # RRD tree JKFlow writes (must match <rrddir> in JKFlow.xml). Apache's
+    # www-data user needs read+traverse access to it to graph the data.
+    jkgrapher_rrddir: /var/lib/jkflow/rrd
+
+    # Apache 2.4 access control for the CGI. Localhost only by default.
+    # Widen deliberately, e.g. "Require ip 127.0.0.1 ::1 10.0.0.0/24".
+    jkgrapher_require: "Require ip 127.0.0.1 ::1"
+
+    # Opt-in: make the RRD tree readable/traversable by others (o+rX) so www-data
+    # can read JKFlow's output. Off by default -- review before touching data dirs.
+    jkgrapher_fix_rrd_perms: false
+
+    # apache2   -> the web server
+    # perl      -> the CGI interpreter
+    # librrds-perl   -> RRDs.pm, the RRD graphing binding JKGrapher.pl uses
+    # libcgi-pm-perl -> CGI.pm (removed from core Perl since 5.22, so required)
+    # rrdtool        -> CLI/library (pulled in anyway by librrds-perl)
+    jkgrapher_apt_packages:
+      - apache2
+      - perl
+      - librrds-perl
+      - libcgi-pm-perl
+      - rrdtool
+
+  handlers:
+    - name: Restart apache2
+      ansible.builtin.service:
+        name: apache2
+        state: restarted
+
+  pre_tasks:
+    - name: Fail early on unsupported distributions
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] in ['Debian', 'Devuan']
+        fail_msg: >-
+          This playbook targets Debian and Devuan only
+          (detected {{ ansible_facts['distribution'] | default('unknown') }}).
+        success_msg: "Distribution {{ ansible_facts['distribution'] }} is supported."
+      tags: [always]
+
+  tasks:
+    - name: Install Apache, Perl and the RRD/CGI dependencies
+      ansible.builtin.apt:
+        name: "{{ jkgrapher_apt_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      tags: [packages]
+
+    # cgid is the CGI module for the threaded MPMs (event/worker) that Debian
+    # ships by default. On a prefork MPM, enable 'cgi' instead.
+    - name: Enable the Apache cgid module
+      ansible.builtin.command:  # noqa: command-instead-of-module
+        cmd: a2enmod cgid
+        creates: /etc/apache2/mods-enabled/cgid.load
+      notify: Restart apache2
+      tags: [apache]
+
+    - name: Ensure the CGI directory exists
+      ansible.builtin.file:
+        path: "{{ jkgrapher_cgi_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags: [apache]
+
+    - name: Deploy JKGrapher.pl (only when jkgrapher_src is provided)
+      ansible.builtin.copy:
+        src: "{{ jkgrapher_src }}"
+        dest: "{{ jkgrapher_cgi_dir }}/{{ jkgrapher_script_name }}"
+        owner: root
+        group: root
+        mode: "0755"
+      when: jkgrapher_src | length > 0
+      notify: Restart apache2
+      tags: [deploy]
+
+    - name: Install the JKGrapher Apache config
+      ansible.builtin.copy:
+        dest: /etc/apache2/conf-available/jkgrapher.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible - JKGrapher CGI grapher
+          ScriptAlias {{ jkgrapher_url_path }}/ "{{ jkgrapher_cgi_dir }}/"
+
+          # Exposed to the script in case it reads the RRD path from the
+          # environment. Harmless if it doesn't; requires mod_env (default on).
+          SetEnv JKFLOW_RRDDIR "{{ jkgrapher_rrddir }}"
+
+          <Directory "{{ jkgrapher_cgi_dir }}">
+              Options +ExecCGI -Indexes
+              AddHandler cgi-script .pl .cgi
+              {{ jkgrapher_require }}
+          </Directory>
+      notify: Restart apache2
+      tags: [apache]
+
+    - name: Enable the JKGrapher Apache config
+      ansible.builtin.command:  # noqa: command-instead-of-module
+        cmd: a2enconf jkgrapher
+        creates: /etc/apache2/conf-enabled/jkgrapher.conf
+      notify: Restart apache2
+      tags: [apache]
+
+    - name: Validate the Apache configuration before any restart
+      ansible.builtin.command: apache2ctl configtest
+      register: jkgrapher_configtest
+      changed_when: false
+      tags: [apache]
+
+    - name: Allow www-data to read the RRD tree (opt-in)
+      ansible.builtin.file:
+        path: "{{ jkgrapher_rrddir }}"
+        mode: u=rwX,g=rX,o=rX
+        recurse: true
+      when: jkgrapher_fix_rrd_perms | bool
+      tags: [apache]
+
+    - name: Ensure Apache is enabled and running
+      ansible.builtin.service:
+        name: apache2
+        state: started
+        enabled: true
+      tags: [apache]
+
+  post_tasks:
+    - name: Confirm the CGI script is present and executable
+      ansible.builtin.stat:
+        path: "{{ jkgrapher_cgi_dir }}/{{ jkgrapher_script_name }}"
+      register: jkgrapher_stat
+      tags: [verify]
+
+    - name: Report setup result
+      ansible.builtin.debug:
+        msg: >-
+          Apache config: {{ jkgrapher_configtest.stdout | default('n/a') | trim }} |
+          script deployed: {{ jkgrapher_stat.stat.exists | default(false) }}
+          (executable: {{ jkgrapher_stat.stat.executable | default(false) }}) |
+          URL: http://<host>{{ jkgrapher_url_path }}/{{ jkgrapher_script_name }}
+          {{ '' if jkgrapher_src | length > 0
+             else '-- NOTE: jkgrapher_src was empty, so no script was deployed.' }}
+      tags: [verify]
