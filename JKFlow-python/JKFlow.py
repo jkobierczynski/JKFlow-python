@@ -223,15 +223,20 @@ class FlowScan:
             ds_type, ds_name = fields[i:i+2]
             fields_config.append(f"DS:{ds_name}:{ds_type}:600:U:U")
         os.makedirs(os.path.dirname(file), exist_ok=True)
-        rrdtool.create(
-            file,
-            "--step", str(step),
-            *fields_config,
+        args = [file, "--step", str(step)]
+        # When back-filling historical captures, anchor the RRD's start before the
+        # first data point; otherwise rrdtool defaults --start to "now" and rejects
+        # any update older than creation time.
+        rrd_start = getattr(self, 'rrd_start', None)
+        if rrd_start is not None:
+            args += ["--start", str(int(rrd_start))]
+        args += fields_config + [
             "RRA:AVERAGE:0.5:1:600",
             "RRA:AVERAGE:0.5:6:700",
             "RRA:AVERAGE:0.5:24:775",
-            "RRA:AVERAGE:0.5:288:797"
-        )
+            "RRA:AVERAGE:0.5:288:797",
+        ]
+        rrdtool.create(*args)
 
     def updateRRD(self, dir: str, name: str, values: List[float]) -> None:
         if rrdtool is None:
@@ -272,6 +277,7 @@ class JKFlow(FlowScan):
     def __init__(self, config_path: Optional[str] = None):
         self.config_path = config_path
         self.filetime = int(time.time())
+        self.rrd_start = None            # optional --start for new RRDs (back-fill)
         # Instance-level copies so multiple instances don't share class dicts.
         self.mylist = defaultdict(dict)
         self.mylist['triesubnets'] = []   # this one is a list, not a dict
@@ -1781,6 +1787,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "(e.g. 'processed') are relative to the file's own directory; "
                          "absolute paths are used as-is. The live nfcapd.current.* file "
                          "is never moved.")
+    ap.add_argument('--rrd-start', default=None, metavar='EPOCH|first',
+                    help="Anchor the start time of NEWLY created RRDs, so historical "
+                         "captures can be back-filled (rrdtool otherwise starts new "
+                         "RRDs at 'now' and rejects older data). Give an epoch second, "
+                         "or 'first' to auto-detect one step before the earliest input "
+                         "file. Only affects RRDs that don't exist yet.")
     ap.add_argument('--no-sort', action='store_true',
                     help="Process files in the given order instead of sorting by "
                          "capture time (sorting is the default and keeps RRD updates "
@@ -1810,6 +1822,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     files = list(args.files)
     if not args.no_sort:
         files.sort(key=reader.filetime_for)
+
+    # Back-fill anchor for newly created RRDs.
+    if args.rrd_start is not None:
+        if str(args.rrd_start).lower() == 'first':
+            candidates = [reader.filetime_for(p) for p in files
+                          if 'current' not in os.path.basename(p)]
+            if candidates:
+                jk.rrd_start = min(candidates) - jk.SAMPLETIME
+        else:
+            try:
+                jk.rrd_start = int(args.rrd_start)
+            except ValueError:
+                ap.error(f"--rrd-start must be an epoch integer or 'first', got {args.rrd_start!r}")
+        if jk.rrd_start is not None:
+            when = datetime.datetime.fromtimestamp(jk.rrd_start)
+            print(f"Anchoring new RRDs at {jk.rrd_start} ({when}); "
+                  f"existing RRDs are left as-is.")
 
     total = 0
     for path in files:
