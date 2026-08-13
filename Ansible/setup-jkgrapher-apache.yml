@@ -19,7 +19,7 @@
 #
 # Usage:
 #   ansible-playbook -i inventory setup-jkgrapher-apache.yml \
-#       -e jkgrapher_src=./JKGrapher.pl -e jkgrapher_rrddir=/var/lib/jkflow/rrd
+#       -e jkgrapher_src=./JKGrapher.pl -e jkgrapher_rrddir=/var/flows/rrds
 #   # local box:
 #   ansible-playbook -i "localhost," -c local setup-jkgrapher-apache.yml \
 #       -e jkgrapher_src=./JKGrapher.pl
@@ -41,7 +41,7 @@
 
     # RRD tree JKFlow writes (must match <rrddir> in JKFlow.xml). Apache's
     # www-data user needs read+traverse access to it to graph the data.
-    jkgrapher_rrddir: /var/lib/jkflow/rrd
+    jkgrapher_rrddir: /var/flows/rrds
 
     # Apache 2.4 access control for the CGI. Localhost only by default.
     # Widen deliberately, e.g. "Require ip 127.0.0.1 ::1 10.0.0.0/24".
@@ -53,14 +53,16 @@
 
     # apache2   -> the web server
     # perl      -> the CGI interpreter
-    # librrds-perl   -> RRDs.pm, the RRD graphing binding JKGrapher.pl uses
-    # libcgi-pm-perl -> CGI.pm (removed from core Perl since 5.22, so required)
-    # rrdtool        -> CLI/library (pulled in anyway by librrds-perl)
+    # librrds-perl     -> RRDs.pm, the RRD graphing binding JKGrapher.pl uses
+    # libcgi-pm-perl   -> CGI.pm / CGI::Pretty (removed from core Perl since 5.22)
+    # libxml-simple-perl -> XML::Simple, used to read JKFlow.xml
+    # rrdtool          -> CLI/library (pulled in anyway by librrds-perl)
     jkgrapher_apt_packages:
       - apache2
       - perl
       - librrds-perl
       - libcgi-pm-perl
+      - libxml-simple-perl
       - rrdtool
 
   handlers:
