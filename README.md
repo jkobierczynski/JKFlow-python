@@ -136,7 +136,7 @@ Full details in **[INSTALL.md](INSTALL.md)**.
 
 ## Documentation
 
-- **[INSTALL.md](INSTALL.md)** — install Ansible, JKFlow.py dependencies, and the
+- **[INSTALL.md](JKFlow-python/INSTALL.md)** — install Ansible, JKFlow.py dependencies, and the
   Apache/JKGrapher CGI, end to end.
 - **[JKFlow-manual.md](JKFlow-python/JKFlow-manual.md)** — JKFlow.py command line, config file,
   workflows, output format, and troubleshooting.
