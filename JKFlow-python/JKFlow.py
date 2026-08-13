@@ -1489,20 +1489,31 @@ class JKFlow(FlowScan):
 # counting closure keeps seeing the same object, matching the Perl globals.
 # =============================================================================
 
-# nfdump CSV column name -> our flowvar name. Byte/packet/tos columns vary a
-# little between nfdump builds, so several candidates are tried in order.
-_CSV_INT_FIELDS = {
-    'srcport': ('sp',),
-    'dstport': ('dp',),
-    'bytes':   ('ibyt', 'byt'),
-    'pkts':    ('ipkt', 'pkt'),
-    'tos':     ('stos', 'tos'),
-    'input_if':  ('in',),
-    'output_if': ('out',),
-    'src_as':  ('sas',),
-    'dst_as':  ('das',),
+# Canonical flow field -> candidate nfdump CSV column names, in priority order.
+# nfdump's `-o csv` header changed between versions: 1.7 emits verbose names
+# (firstSeen, proto, srcAddr, srcPort, dstAddr, dstPort, packets, bytes, ...),
+# while older builds used terse ones (ts, pr, sa, sp, da, dp, ipkt, ibyt, ...).
+# We resolve each field against whatever header is actually present, so both
+# work. Fields absent from a given format (exporter/AS/interface/tos for locally
+# captured nfpcapd flows) simply default to 0.
+_CSV_ALIASES = {
+    'srcaddr':    ['sa', 'srcAddr', 'srcaddr', 'src_addr'],
+    'dstaddr':    ['da', 'dstAddr', 'dstaddr', 'dst_addr'],
+    'srcport':    ['sp', 'srcPort', 'srcport', 'src_port'],
+    'dstport':    ['dp', 'dstPort', 'dstport', 'dst_port'],
+    'protocol':   ['pr', 'proto', 'protocol'],
+    'bytes':      ['ibyt', 'byt', 'bytes', 'obyt', 'in_bytes'],
+    'pkts':       ['ipkt', 'pkt', 'packets', 'opkt', 'in_packets'],
+    'tos':        ['stos', 'tos', 'dtos'],
+    'input_if':   ['in', 'input', 'in_if'],
+    'output_if':  ['out', 'output', 'out_if'],
+    'src_as':     ['sas', 'srcas', 'src_as'],
+    'dst_as':     ['das', 'dstas', 'dst_as'],
+    'exporterip': ['ra', 'router', 'exporter'],
+    '_start':     ['ts', 'firstSeen', 'tstart', 'first'],
+    '_end':       ['te', 'lastSeen', 'tend', 'last'],
+    '_dur':       ['td', 'duration', 'dur'],
 }
-_CSV_ADDR_FIELDS = {'srcaddr': 'sa', 'dstaddr': 'da', 'exporterip': 'ra'}
 
 
 def _ip_to_int(value: str) -> Optional[int]:
@@ -1535,59 +1546,90 @@ def _parse_time(value: str) -> int:
         return 0
 
 
-def _int_field(row: Dict[str, str], candidates) -> int:
-    for name in candidates:
-        if name in row and row[name] not in (None, '', ' '):
-            try:
-                return int(str(row[name]).strip())
-            except ValueError:
-                try:
-                    return int(float(str(row[name]).strip()))
-                except ValueError:
-                    return 0
-    return 0
+def _to_int(value) -> int:
+    if value in (None, '', ' '):
+        return 0
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        try:
+            return int(float(str(value).strip()))
+        except ValueError:
+            return 0
 
 
 def parse_nfdump_csv(lines: Iterator[str]) -> Iterator[Dict[str, int]]:
     """Yield flow-variable dicts from nfdump CSV lines (an iterable of strings).
 
-    Skips nfdump's trailing 'Summary'/stats block automatically: any row without
-    a usable source address ends the flow section.
+    The header is inspected once to map each flow field onto whichever column
+    name this nfdump build uses. Rows whose source address doesn't parse as IPv4
+    (the trailing 'Summary'/stats block, or IPv6 flows) are skipped.
     """
     import csv
     reader = csv.DictReader(lines)
+    header = set(reader.fieldnames or [])
+
+    # Resolve canonical field -> actual column name present in this CSV.
+    colmap: Dict[str, str] = {}
+    for canon, candidates in _CSV_ALIASES.items():
+        for name in candidates:
+            if name in header:
+                colmap[canon] = name
+                break
+
+    # Without source/destination address columns this isn't a flow CSV.
+    if 'srcaddr' not in colmap or 'dstaddr' not in colmap:
+        return
+
+    int_fields = ('srcport', 'dstport', 'bytes', 'pkts', 'tos',
+                  'input_if', 'output_if', 'src_as', 'dst_as')
+
     for row in reader:
         if row is None:
             continue
-        sa = row.get('sa')
-        if sa is None:
-            # Reached the summary block (different columns) -> stop.
-            break
-        srcaddr = _ip_to_int(sa)
-        dstaddr = _ip_to_int(row.get('da', ''))
+        srcaddr = _ip_to_int(row.get(colmap['srcaddr'], ''))
+        dstaddr = _ip_to_int(row.get(colmap['dstaddr'], ''))
         if srcaddr is None or dstaddr is None:
-            # Summary line, IPv6, or malformed -> skip.
+            # Summary/stats line, IPv6, or malformed -> skip (don't stop; the
+            # summary block can be preceded by a blank line).
             continue
 
         rec = {
-            'srcaddr': srcaddr,
-            'dstaddr': dstaddr,
-            'exporterip': _ip_to_int(row.get('ra', '')) or 0,
+            'srcaddr': srcaddr, 'dstaddr': dstaddr,
+            'srcport': 0, 'dstport': 0, 'protocol': 0, 'bytes': 0, 'pkts': 0,
+            'tos': 0, 'exporterip': 0, 'input_if': 0, 'output_if': 0,
+            'src_as': 0, 'dst_as': 0, 'endtime': 0,
         }
-        for var, candidates in _CSV_INT_FIELDS.items():
-            rec[var] = _int_field(row, candidates)
+        for canon in int_fields:
+            if canon in colmap:
+                rec[canon] = _to_int(row.get(colmap[canon]))
 
-        # protocol: nfdump prints a name (TCP) or a number depending on build.
-        pr = str(row.get('pr', '')).strip()
-        if pr.isdigit():
-            rec['protocol'] = int(pr)
-        else:
-            try:
-                rec['protocol'] = normalize_proto(pr.lower()) if pr else 0
-            except OSError:
-                rec['protocol'] = 0
+        if 'protocol' in colmap:
+            pr = str(row.get(colmap['protocol'], '')).strip()
+            if pr.isdigit():
+                rec['protocol'] = int(pr)
+            elif pr:
+                try:
+                    rec['protocol'] = normalize_proto(pr.lower())
+                except OSError:
+                    rec['protocol'] = 0
 
-        rec['endtime'] = _parse_time(row.get('te', '') or row.get('ts', ''))
+        if 'exporterip' in colmap:
+            rec['exporterip'] = _ip_to_int(row.get(colmap['exporterip'], '')) or 0
+
+        # endtime: prefer an explicit end column; else start (+ duration).
+        if '_end' in colmap:
+            rec['endtime'] = _parse_time(row.get(colmap['_end'], ''))
+        elif '_start' in colmap:
+            start = _parse_time(row.get(colmap['_start'], ''))
+            dur = 0.0
+            if '_dur' in colmap:
+                try:
+                    dur = float(row.get(colmap['_dur']) or 0)
+                except ValueError:
+                    dur = 0.0
+            rec['endtime'] = int(start + dur)
+
         yield rec
 
 
@@ -1599,8 +1641,10 @@ class NfdumpReader:
     in JKFlow.py needs to change.
     """
 
-    #: nfcapd files are conventionally named nfcapd.YYYYMMDDHHMM
-    _NFCAPD_RE = re.compile(r'nfcapd\.(\d{12})$')
+    #: nfcapd files are named nfcapd.YYYYMMDDHHMM, or nfcapd.YYYYMMDDHHMMSS when
+    #: the rotation interval is under 60s. (nfcapd.current.<pid> is the live file
+    #: and has no timestamp -> falls back to mtime.)
+    _NFCAPD_RE = re.compile(r'nfcapd\.(\d{14}|\d{12})$')
 
     def __init__(self, nfdump: str = 'nfdump', extra_args: Optional[List[str]] = None):
         self.nfdump = nfdump
@@ -1610,8 +1654,10 @@ class NfdumpReader:
         """Nominal capture time: from the nfcapd.<stamp> filename, else mtime."""
         m = self._NFCAPD_RE.search(os.path.basename(path))
         if m:
+            stamp = m.group(1)
+            fmt = "%Y%m%d%H%M%S" if len(stamp) == 14 else "%Y%m%d%H%M"
             try:
-                return int(datetime.datetime.strptime(m.group(1), "%Y%m%d%H%M").timestamp())
+                return int(datetime.datetime.strptime(stamp, fmt).timestamp())
             except ValueError:
                 pass
         try:
