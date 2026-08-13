@@ -264,8 +264,8 @@ class JKFlow(FlowScan):
     ROUTERS = {}
     SERVICES = {}
     mylist = defaultdict(dict)
-    RRDDIR = '.'
-    SCOREDIR = '.'
+    RRDDIR = '/var/flows/rrds'
+    SCOREDIR = '/var/flows/reports'
     SUBNETS = None
     trie = None
 
@@ -311,8 +311,8 @@ class JKFlow(FlowScan):
         # (sites, definesets, routergroups). It was never stored -> AttributeError.
         self.config = config
 
-        self.RRDDIR = config.get('rrddir', '.')
-        self.SCOREDIR = config.get('scoredir', '.')
+        self.RRDDIR = config.get('rrddir', '/var/flows/rrds')
+        self.SCOREDIR = config.get('scoredir', '/var/flows/reports')
         self.SAMPLETIME = int(config.get('sampletime', self.SAMPLETIME))
 
         if 'all' in config:
