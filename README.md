@@ -33,9 +33,9 @@ and performance tuning of the hot path (~800k records/file).
 **Status: to be done — use `JKGrapher.pl` for now.**
 
 The web grapher (the CGI that turns the RRDs into graphs) has **not** been ported
-yet. In the meantime the original Perl `JKGrapher.pl` works against the RRDs this
-project produces; the [installation guide](INSTALL.md) covers serving it under
-Apache. Porting it to Python is the next major piece of work.
+yet. In the meantime the original Perl `JKGrapher.pl` of the original jkflow project 
+works against the RRDs this project produces; the [installation guide](JKFlow-python/INSTALL.md) 
+covers serving it under Apache. Porting it to Python is the next major piece of work.
 
 ### 3. Move beyond RRDtool
 
